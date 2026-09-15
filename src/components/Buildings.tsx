@@ -1820,7 +1820,6 @@ function updateEarthquakeGeometry(
     }
 
     position.needsUpdate = true;
-    batch.geometry.computeBoundingSphere();
   }
 }
 
@@ -2219,27 +2218,13 @@ function createWindowMesh(
       WINDOW_DEPTH
     );
 
-  const material =
-    new THREE.MeshStandardMaterial({
-      color:
-        "#7fb8cb",
-
-      roughness:
-        0.28,
-
-      metalness:
-        0.05,
-
-      emissive:
-        WINDOW_EMISSIVE,
-
-      emissiveIntensity:
-        0.35,
-
-      vertexColors:
-        true,
-    });
-
+const material =
+  new THREE.MeshStandardMaterial({
+    color: "#ffffff",
+    vertexColors: true,
+    roughness: 0.92,
+    metalness: 0.0,
+  });
   const mesh =
     new THREE.InstancedMesh(
       geometry,
@@ -2567,15 +2552,12 @@ export default function Buildings({
      MATERIAL
   ============================================================== */
 
-  const material =
-    useMemo(() => {
-      return new THREE.MeshStandardMaterial({
-        color: "#ffffff",
-        vertexColors: true,
-        roughness: 0.92,
-        metalness: 0.0,
-      });
-    }, []);
+const material = useMemo(() => {
+  return new THREE.MeshBasicMaterial({
+    color: "#ffffff",
+    vertexColors: true,
+  });
+}, []);
 
   /* =============================================================
      WINDOWS
@@ -2615,21 +2597,32 @@ export default function Buildings({
 
   const earthquakeProgress = useRef(0);
   const earthquakeElapsed = useRef(0);
+  const earthquakeUpdateAccumulator = useRef(0);
+
+  /*
+   * Earthquake deformation touches every building vertex.
+   * Limit geometry updates so camera movement stays responsive.
+   */
+  const EARTHQUAKE_GEOMETRY_STEP = 1 / 12;
 
   useEffect(() => {
     earthquakeProgress.current = 0;
     earthquakeElapsed.current = 0;
+    earthquakeUpdateAccumulator.current = 0;
   }, [earthquakeOrigin, earthquakeMagnitude]);
 
-  useFrame((state, delta) => {
+  /*
+   * RESET FIX:
+   * When the earthquake is stopped/reset, restore every vertex from
+   * the untouched basePositions array. The old code only reset the
+   * animation clock, so deformed buildings could remain broken.
+   */
+  useEffect(() => {
     if (batches.length === 0) {
       return;
     }
 
     if (!earthquakeActive || !earthquakeOrigin) {
-      earthquakeProgress.current = 0;
-      earthquakeElapsed.current = 0;
-
       updateEarthquakeGeometry(
         batches,
         null,
@@ -2639,6 +2632,23 @@ export default function Buildings({
         0
       );
 
+      earthquakeProgress.current = 0;
+      earthquakeElapsed.current = 0;
+      earthquakeUpdateAccumulator.current = 0;
+    }
+  }, [
+    batches,
+    earthquakeActive,
+    earthquakeOrigin,
+    earthquakeMagnitude,
+  ]);
+
+  useFrame((_, delta) => {
+    if (
+      batches.length === 0 ||
+      !earthquakeActive ||
+      !earthquakeOrigin
+    ) {
       return;
     }
 
@@ -2649,6 +2659,21 @@ export default function Buildings({
       0,
       1
     );
+
+    earthquakeUpdateAccumulator.current += delta;
+
+    /*
+     * Do not deform thousands of vertices on every render frame.
+     * OrbitControls remains responsive between geometry updates.
+     */
+    if (
+      earthquakeUpdateAccumulator.current <
+      EARTHQUAKE_GEOMETRY_STEP
+    ) {
+      return;
+    }
+
+    earthquakeUpdateAccumulator.current = 0;
 
     updateEarthquakeGeometry(
       batches,
@@ -2688,6 +2713,106 @@ useEffect(() => {
   earthquakeMagnitude,
   earthquakeActive,
 ]);
+
+  /* ==============================================================
+     UPDATE SELECTED BUILDING DETAILS
+  ============================================================== */
+
+  useEffect(() => {
+    if (
+      selectedIndex === null ||
+      batches.length === 0 ||
+      !onBuildingSelect
+    ) {
+      return;
+    }
+
+    let building: PreparedBuilding | null = null;
+
+    for (const batch of batches) {
+      const found = batch.buildings.find(
+        (range) => range.prepared.index === selectedIndex
+      );
+
+      if (found) {
+        building = found.prepared;
+        break;
+      }
+    }
+
+    if (!building) return;
+
+    const floodDepth = Math.max(
+      0,
+      getFloodSurfaceElevation(
+        Math.max(
+          0,
+          Math.min(
+            MAX_FLOOD_DEPTH,
+            waterLevel - MIN_ELEVATION
+          )
+        )
+      ) - building.terrainElevation
+    );
+
+    let earthquakeDamage = 0;
+    let earthquakeDistance: number | null = null;
+    let earthquakeStatus:
+      | "safe"
+      | "minor"
+      | "moderate"
+      | "severe"
+      | "destroyed" = "safe";
+
+    if (earthquakeOrigin && earthquakeActive) {
+      const dx = building.centerX - earthquakeOrigin.x;
+      const dz = building.centerZ - earthquakeOrigin.z;
+
+      earthquakeDistance = Math.sqrt(dx * dx + dz * dz);
+
+      earthquakeDamage = Math.round(
+        getEarthquakeDamage(
+          building.centerX,
+          building.centerZ,
+          earthquakeOrigin,
+          earthquakeMagnitude
+        ) * 100
+      );
+
+      earthquakeDamage = THREE.MathUtils.clamp(
+        earthquakeDamage,
+        0,
+        100
+      );
+
+      earthquakeStatus = getEarthquakeDamageLevel(
+        earthquakeDamage / 100
+      ) as typeof earthquakeStatus;
+    }
+
+    onBuildingSelect({
+      index: building.index,
+      longitude: building.longitude,
+      latitude: building.latitude,
+      terrainElevation: building.terrainElevation,
+      height: building.height,
+      floodDepth,
+      properties: building.properties,
+      centerX: building.centerX,
+      centerZ: building.centerZ,
+      earthquakeDamage,
+      earthquakeDistance,
+      earthquakeStatus,
+    });
+  }, [
+    selectedIndex,
+    batches,
+    waterLevel,
+    earthquakeOrigin,
+    earthquakeMagnitude,
+    earthquakeActive,
+    onBuildingSelect,
+  ]);
 
   /* ==============================================================
      CLICK HANDLER
@@ -2905,33 +3030,27 @@ useEffect(() => {
           batch,
           index
         ) => (
-          <mesh
-            key={index}
-            geometry={
-              batch.geometry
-            }
-            material={
-              material
-            }
-            castShadow={false}
-            receiveShadow
-            onClick={(event) =>
-              handleBuildingClick(
-                event,
-                batch
-              )
-            }
-          />
+<mesh
+  key={index}
+  geometry={batch.geometry}
+  material={material}
+  castShadow={false}
+  receiveShadow={false}
+  frustumCulled={!earthquakeActive}
+  onClick={(event) =>
+    handleBuildingClick(event, batch)
+  }
+/>
         )
       )}
 
       {/* Visual window layer. It deliberately does not receive pointer events. */}
-      {windowMesh && (
+      {/* {windowMesh && (
         <primitive
           object={windowMesh}
           visible={!earthquakeActive}
         />
-      )}
+      )} */}
 
     </group>
   );
