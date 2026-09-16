@@ -7,11 +7,38 @@ import { useLoader } from "@react-three/fiber";
 import {
   ELEVATION_SCALE,
   worldToNormalized,
+  MIN_ELEVATION,
+  MAX_ELEVATION,
 } from "@/lib/terrain";
 
 /* ================================================================
+   FLOOD CONFIGURATION
+   ================================================================ */
+
+const MAX_FLOOD_DEPTH = 6;
+
+/*
+ * This MUST match FloodWater.tsx and floodAnalysis.ts.
+ *
+ * 0m flood  -> MIN_ELEVATION
+ * 6m flood  -> MIN_ELEVATION + 17m
+ */
+const FLOOD_VISUAL_TERRAIN_RANGE = 17;
+
+/*
+ * Same threshold used by floodAnalysis.ts.
+ */
+const ROAD_FLOOD_THRESHOLD = 0.03;
+
+/*
+ * Colors used during flood simulation.
+ */
+const SAFE_ROAD_COLOR = "#22c55e";
+const AFFECTED_ROAD_COLOR = "#ef4444";
+
+/* ================================================================
    TYPES
-================================================================ */
+   ================================================================ */
 
 type Point = {
   x: number;
@@ -26,18 +53,27 @@ type RoadPath = {
 
 type RoadsProps = {
   paths?: RoadPath[];
+
+  /*
+   * Current simulated flood depth in metres.
+   */
+  floodDepth?: number;
+
+  /*
+   * Only show red/green flood status when
+   * the Flood scenario is active.
+   */
+  floodMode?: boolean;
 };
 
 /* ================================================================
    ROAD WIDTH
-================================================================ */
+   ================================================================ */
 
 function getRoadWidth(
   highway?: string
 ): number {
-
   switch (highway) {
-
     case "motorway":
       return 0.14;
 
@@ -80,15 +116,13 @@ function getRoadWidth(
 }
 
 /* ================================================================
-   ROAD COLOR
-================================================================ */
+   NORMAL ROAD COLOR
+   ================================================================ */
 
 function getRoadColor(
   highway?: string
 ): string {
-
   switch (highway) {
-
     case "motorway":
       return "#292a2d";
 
@@ -132,16 +166,13 @@ function getRoadColor(
 
 /* ================================================================
    TERRAIN SAMPLER
-================================================================ */
+   ================================================================ */
 
 function createTerrainSampler(
   image: HTMLImageElement
 ) {
-
   const canvas =
-    document.createElement(
-      "canvas"
-    );
+    document.createElement("canvas");
 
   canvas.width =
     image.width;
@@ -150,9 +181,7 @@ function createTerrainSampler(
     image.height;
 
   const context =
-    canvas.getContext(
-      "2d"
-    );
+    canvas.getContext("2d");
 
   if (!context) {
     return null;
@@ -185,8 +214,8 @@ function createTerrainSampler(
 }
 
 /* ================================================================
-   TERRAIN HEIGHT
-================================================================ */
+   TERRAIN HEIGHT USED BY 3D ROAD
+   ================================================================ */
 
 function getTerrainHeight(
   x: number,
@@ -223,28 +252,25 @@ function getTerrainHeight(
   const pixelX =
     Math.round(
       nx *
-        (
-          sampler.width -
-          1
-        )
+      (
+        sampler.width - 1
+      )
     );
 
   const pixelY =
     Math.round(
       (
-        1 -
-        nz
+        1 - nz
       ) *
-        (
-          sampler.height -
-          1
-        )
+      (
+        sampler.height - 1
+      )
     );
 
   const pixelIndex =
     (
       pixelY *
-        sampler.width +
+      sampler.width +
       pixelX
     ) * 4;
 
@@ -255,13 +281,203 @@ function getTerrainHeight(
 
   return (
     value / 255
-  ) *
-    ELEVATION_SCALE;
+  ) * ELEVATION_SCALE;
+}
+
+/* ================================================================
+   REAL TERRAIN ELEVATION
+   ================================================================ */
+
+/*
+ * This is intentionally different from getTerrainHeight().
+ *
+ * getTerrainHeight() is the scaled 3D rendering height.
+ *
+ * This function uses the REAL elevation range used by
+ * floodAnalysis.ts:
+ *
+ * MIN_ELEVATION → MAX_ELEVATION
+ *
+ * That allows road flood classification to use the same
+ * elevation logic as the existing flood analysis.
+ */
+
+function getRealTerrainElevation(
+  x: number,
+  z: number,
+  sampler: ReturnType<
+    typeof createTerrainSampler
+  >
+): number {
+
+  if (!sampler) {
+    return MIN_ELEVATION;
+  }
+
+  const normalized =
+    worldToNormalized(
+      x,
+      z
+    );
+
+  const nx =
+    THREE.MathUtils.clamp(
+      normalized.x,
+      0,
+      1
+    );
+
+  const nz =
+    THREE.MathUtils.clamp(
+      normalized.z,
+      0,
+      1
+    );
+
+  const pixelX =
+    Math.round(
+      nx *
+      (
+        sampler.width - 1
+      )
+    );
+
+  const pixelY =
+    Math.round(
+      (
+        1 - nz
+      ) *
+      (
+        sampler.height - 1
+      )
+    );
+
+  const pixelIndex =
+    (
+      pixelY *
+      sampler.width +
+      pixelX
+    ) * 4;
+
+  const value =
+    sampler.pixels[
+      pixelIndex
+    ] ?? 0;
+
+  const normalizedHeight =
+    value / 255;
+
+  return (
+    MIN_ELEVATION +
+    normalizedHeight *
+    (
+      MAX_ELEVATION -
+      MIN_ELEVATION
+    )
+  );
+}
+
+/* ================================================================
+   FLOOD ELEVATION
+   ================================================================ */
+
+function getFloodElevation(
+  floodDepth: number
+): number {
+
+  const normalizedFlood =
+    THREE.MathUtils.clamp(
+      floodDepth /
+      MAX_FLOOD_DEPTH,
+      0,
+      1
+    );
+
+  return (
+    MIN_ELEVATION +
+    normalizedFlood *
+    FLOOD_VISUAL_TERRAIN_RANGE
+  );
+}
+
+/* ================================================================
+   ROAD AFFECTED CHECK
+   ================================================================ */
+
+/*
+ * This follows the same basic logic as floodAnalysis.ts:
+ *
+ * - sample approximately 12 points
+ * - get local terrain elevation
+ * - compare it with the flood surface
+ * - if any sampled point has > 0.03m water,
+ *   the entire road is considered affected.
+ */
+
+function isRoadAffected(
+  road: RoadPath,
+  sampler: ReturnType<
+    typeof createTerrainSampler
+  >,
+  floodElevation: number
+): boolean {
+
+  if (
+    !road.points ||
+    road.points.length < 2
+  ) {
+    return false;
+  }
+
+  const step =
+    Math.max(
+      1,
+      Math.floor(
+        road.points.length / 12
+      )
+    );
+
+  for (
+    let i = 0;
+    i < road.points.length;
+    i += step
+  ) {
+
+    const point =
+      road.points[i];
+
+    if (!point) {
+      continue;
+    }
+
+    const elevation =
+      getRealTerrainElevation(
+        point.x,
+        point.z,
+        sampler
+      );
+
+    const localDepth =
+      Math.max(
+        0,
+        floodElevation -
+        elevation
+      );
+
+    if (
+      localDepth >
+      ROAD_FLOOD_THRESHOLD
+    ) {
+      return true;
+    }
+  }
+
+  return false;
 }
 
 /* ================================================================
    ADD ROAD SEGMENT
-================================================================ */
+   ================================================================ */
 
 function addRoadSegment(
   positions: number[],
@@ -289,10 +505,6 @@ function addRoadSegment(
 
   direction.normalize();
 
-  /*
-   * Horizontal perpendicular.
-   */
-
   const perpendicular =
     new THREE.Vector3(
       -direction.z,
@@ -302,11 +514,6 @@ function addRoadSegment(
 
   const halfWidth =
     width / 2;
-
-  /*
-   * Tiny overlap between
-   * consecutive road pieces.
-   */
 
   const extension =
     0.015;
@@ -346,10 +553,6 @@ function addRoadSegment(
       perpendicular,
       halfWidth
     );
-
-  /*
-   * Very thin road thickness.
-   */
 
   const thickness =
     0.025;
@@ -488,14 +691,16 @@ function addRoadSegment(
 
 /* ================================================================
    CREATE COMBINED ROAD GEOMETRY
-================================================================ */
+   ================================================================ */
 
 function createCombinedRoadGeometry(
   paths: RoadPath[],
   sampler: ReturnType<
     typeof createTerrainSampler
   >,
-  highway: string
+  highway: string,
+  floodDepth: number,
+  floodMode: boolean
 ) {
 
   const positions:
@@ -504,18 +709,42 @@ function createCombinedRoadGeometry(
   const indices:
     number[] = [];
 
+  const colors:
+    number[] = [];
+
   const width =
     getRoadWidth(
       highway
     );
 
-  /*
-   * Raise roads slightly above
-   * the terrain.
-   */
-
   const roadOffset =
     0.10;
+
+  const floodElevation =
+    getFloodElevation(
+      floodDepth
+    );
+
+  /*
+   * Convert the two flood colors to THREE colors.
+   */
+
+  const safeColor =
+    new THREE.Color(
+      SAFE_ROAD_COLOR
+    );
+
+  const affectedColor =
+    new THREE.Color(
+      AFFECTED_ROAD_COLOR
+    );
+
+  const normalColor =
+    new THREE.Color(
+      getRoadColor(
+        highway
+      )
+    );
 
   for (
     const road of paths
@@ -536,6 +765,31 @@ function createCombinedRoadGeometry(
     ) {
       continue;
     }
+
+    /*
+     * Determine whether THIS road is affected.
+     *
+     * Important:
+     * The complete road becomes red if any sampled
+     * part of that road is affected.
+     */
+
+    const affected =
+      floodMode &&
+      isRoadAffected(
+        road,
+        sampler,
+        floodElevation
+      );
+
+    const roadColor =
+      floodMode
+        ? (
+            affected
+              ? affectedColor
+              : safeColor
+          )
+        : normalColor;
 
     for (
       let i = 0;
@@ -575,7 +829,7 @@ function createCombinedRoadGeometry(
         new THREE.Vector3(
           current.x,
           terrainY1 +
-            roadOffset,
+          roadOffset,
           current.z
         );
 
@@ -583,9 +837,12 @@ function createCombinedRoadGeometry(
         new THREE.Vector3(
           next.x,
           terrainY2 +
-            roadOffset,
+          roadOffset,
           next.z
         );
+
+      const before =
+        positions.length / 3;
 
       addRoadSegment(
         positions,
@@ -594,12 +851,36 @@ function createCombinedRoadGeometry(
         b,
         width
       );
+
+      /*
+       * addRoadSegment creates 8 vertices.
+       *
+       * Give every vertex of this segment
+       * the same road status color.
+       */
+
+      const after =
+        positions.length / 3;
+
+      const verticesAdded =
+        after - before;
+
+      for (
+        let v = 0;
+        v < verticesAdded;
+        v++
+      ) {
+        colors.push(
+          roadColor.r,
+          roadColor.g,
+          roadColor.b
+        );
+      }
     }
   }
 
   if (
-    positions.length ===
-    0
+    positions.length === 0
   ) {
     return null;
   }
@@ -611,6 +892,14 @@ function createCombinedRoadGeometry(
     "position",
     new THREE.Float32BufferAttribute(
       positions,
+      3
+    )
+  );
+
+  geometry.setAttribute(
+    "color",
+    new THREE.Float32BufferAttribute(
+      colors,
       3
     )
   );
@@ -628,7 +917,7 @@ function createCombinedRoadGeometry(
 
 /* ================================================================
    ROAD MARKINGS
-================================================================ */
+   ================================================================ */
 
 function createRoadMarkingGeometry(
   paths: RoadPath[],
@@ -638,21 +927,10 @@ function createRoadMarkingGeometry(
   highway: string
 ) {
 
-  /*
-   * Only add markings to
-   * major roads.
-   *
-   * This prevents thousands
-   * of extra objects.
-   */
-
   const major =
-    highway ===
-      "primary" ||
-    highway ===
-      "secondary" ||
-    highway ===
-      "trunk";
+    highway === "primary" ||
+    highway === "secondary" ||
+    highway === "trunk";
 
   if (!major) {
     return null;
@@ -663,10 +941,6 @@ function createRoadMarkingGeometry(
 
   const indices:
     number[] = [];
-
-  /*
-   * Very thin center line.
-   */
 
   const lineWidth =
     0.012;
@@ -737,14 +1011,6 @@ function createRoadMarkingGeometry(
       }
 
       direction.normalize();
-
-      /*
-       * Only draw a portion of
-       * each road segment.
-       *
-       * This gives a dashed
-       * road-marking effect.
-       */
 
       const segmentLength =
         length * 0.55;
@@ -870,8 +1136,7 @@ function createRoadMarkingGeometry(
   }
 
   if (
-    positions.length ===
-    0
+    positions.length === 0
   ) {
     return null;
   }
@@ -898,15 +1163,17 @@ function createRoadMarkingGeometry(
 
 /* ================================================================
    ROADS
-================================================================ */
+   ================================================================ */
 
 export default function Roads({
   paths = [],
+  floodDepth = 0,
+  floodMode = false,
 }: RoadsProps) {
 
   /*
-   * Load the SAME heightmap
-   * used by terrain/buildings.
+   * Load the SAME heightmap used by
+   * terrain/buildings/flood analysis.
    */
 
   const heightmap =
@@ -915,10 +1182,9 @@ export default function Roads({
       "/velachery-heightmap.png"
     );
 
-  /*
-   * ==============================================================
-   * TERRAIN SAMPLER
-   * ============================================================== */
+  /* ==============================================================
+     TERRAIN SAMPLER
+     ============================================================== */
 
   const terrainSampler =
     useMemo(() => {
@@ -940,10 +1206,9 @@ export default function Roads({
       heightmap,
     ]);
 
-  /*
-   * ==============================================================
-   * ROAD TYPES
-   * ============================================================== */
+  /* ==============================================================
+     ROAD TYPES
+     ============================================================== */
 
   const roadTypes =
     useMemo(() => {
@@ -958,11 +1223,9 @@ export default function Roads({
         if (
           road?.highway
         ) {
-
           types.add(
             road.highway
           );
-
         }
       }
 
@@ -974,10 +1237,9 @@ export default function Roads({
       paths,
     ]);
 
-  /*
-   * ==============================================================
-   * ROAD GEOMETRIES
-   * ============================================================== */
+  /* ==============================================================
+     ROAD GEOMETRIES
+     ============================================================== */
 
   const roadGeometries =
     useMemo(() => {
@@ -996,15 +1258,16 @@ export default function Roads({
         }> = [];
 
       for (
-        const type of
-          roadTypes
+        const type of roadTypes
       ) {
 
         const geometry =
           createCombinedRoadGeometry(
             paths,
             terrainSampler,
-            type
+            type,
+            floodDepth,
+            floodMode
           );
 
         if (!geometry) {
@@ -1017,23 +1280,19 @@ export default function Roads({
         });
       }
 
-      console.log(
-        "Optimized road geometries:",
-        result.length
-      );
-
       return result;
 
     }, [
       paths,
       terrainSampler,
       roadTypes,
+      floodDepth,
+      floodMode,
     ]);
 
-  /*
-   * ==============================================================
-   * ROAD MARKINGS
-   * ============================================================== */
+  /* ==============================================================
+     ROAD MARKINGS
+     ============================================================== */
 
   const markingGeometries =
     useMemo(() => {
@@ -1052,8 +1311,7 @@ export default function Roads({
         }> = [];
 
       for (
-        const type of
-          roadTypes
+        const type of roadTypes
       ) {
 
         const geometry =
@@ -1081,158 +1339,87 @@ export default function Roads({
       roadTypes,
     ]);
 
-  /*
-   * ==============================================================
-   * ROAD MATERIALS
-   * ============================================================== */
+  /* ==============================================================
+     ROAD MATERIAL
+     ============================================================== */
 
-  const materials =
+  const roadMaterial =
     useMemo(() => {
 
-      const result =
-        new Map<
-          string,
-          THREE.MeshStandardMaterial
-        >();
+      return new THREE.MeshStandardMaterial({
+        vertexColors: true,
+        roughness: 0.95,
+        metalness: 0,
+        side: THREE.FrontSide,
+      });
 
-      for (
-        const type of
-          roadTypes
-      ) {
+    }, []);
 
-        result.set(
-          type,
-          new THREE.MeshStandardMaterial(
-            {
-              color:
-                getRoadColor(
-                  type
-                ),
-
-              roughness:
-                0.95,
-
-              metalness:
-                0,
-
-              side:
-                THREE.FrontSide,
-            }
-          )
-        );
-      }
-
-      return result;
-
-    }, [
-      roadTypes,
-    ]);
-
-  /*
-   * ==============================================================
-   * MARKING MATERIAL
-   * ============================================================== */
+  /* ==============================================================
+     MARKING MATERIAL
+     ============================================================== */
 
   const markingMaterial =
     useMemo(() => {
 
-      return new THREE.MeshStandardMaterial(
-        {
-          color:
-            "#e7d88a",
-
-          roughness:
-            0.9,
-
-          metalness:
-            0,
-
-          side:
-            THREE.FrontSide,
-        }
-      );
+      return new THREE.MeshStandardMaterial({
+        color: "#e7d88a",
+        roughness: 0.9,
+        metalness: 0,
+        side: THREE.FrontSide,
+      });
 
     }, []);
 
-  /*
-   * ==============================================================
-   * RENDER
-   * ============================================================== */
+  /* ==============================================================
+     RENDER
+     ============================================================== */
 
   return (
     <group>
 
-      {/* ========================================================
+      {/* ==========================================================
           ROAD SURFACES
-      ======================================================== */}
+      ========================================================== */}
 
       {roadGeometries.map(
-        (
-          road
-        ) => {
-
-          const material =
-            materials.get(
-              road.type
-            );
-
-          if (!material) {
-            return null;
-          }
+        (road) => {
 
           return (
             <mesh
-              key={
-                road.type
-              }
-
+              key={road.type}
               geometry={
                 road.geometry
               }
-
               material={
-                material
+                roadMaterial
               }
-
               receiveShadow
-
-              castShadow={
-                false
-              }
+              castShadow={false}
             />
           );
         }
       )}
 
-      {/* ========================================================
+      {/* ==========================================================
           ROAD MARKINGS
-      ======================================================== */}
+      ========================================================== */}
 
       {markingGeometries.map(
-        (
-          marking
-        ) => (
+        (marking) => (
 
           <mesh
             key={
               `marking-${marking.type}`
             }
-
             geometry={
               marking.geometry
             }
-
             material={
               markingMaterial
             }
-
-            receiveShadow={
-              false
-            }
-
-            castShadow={
-              false
-            }
+            receiveShadow={false}
+            castShadow={false}
           />
 
         )

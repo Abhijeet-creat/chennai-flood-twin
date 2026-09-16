@@ -330,6 +330,7 @@ function useRoadPaths() {
 function Scene({
   disasterType,
   waterSurface,
+  floodDepth,
   roadPaths,
   onBuildingSelect,
   earthquakePoint,
@@ -340,6 +341,8 @@ function Scene({
   disasterType: DisasterType;
 
   waterSurface: number;
+
+  floodDepth: number;
 
   roadPaths: RoadPath[];
 
@@ -391,9 +394,13 @@ function Scene({
           ROADS
       ========================================================== */}
 
-      <Roads
-        paths={roadPaths}
-      />
+<Roads
+  paths={roadPaths}
+  floodDepth={floodDepth}
+  floodMode={
+    disasterType === "flood"
+  }
+/>
 
       {/* ==========================================================
           BUILDINGS
@@ -942,7 +949,7 @@ const resetEarthquake = () => {
           1.5,
         ]}
       >
-        <Scene
+<Scene
   onBuildingSelect={
     setSelectedBuilding
   }
@@ -953,6 +960,10 @@ const resetEarthquake = () => {
 
   waterSurface={
     waterSurface
+  }
+
+  floodDepth={
+    floodDepth
   }
 
   roadPaths={
